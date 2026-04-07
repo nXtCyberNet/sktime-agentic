@@ -1,10 +1,11 @@
-
-from matplotlib.pylab import Any
+﻿from matplotlib.pylab import Any
 import numpy as np
 from typing import Dict, Any, List, Optional
 
-from python.app.mcp import detect_seasonality
 from .check_structural_break import check_structural_break_tool
+from .detect_seasonality import detect_seasonality_tool
+from .get_model_complexity_budget import get_model_complexity_budget_tool
+from .estimate_training_cost import estimate_training_cost_tool
 
 class MCPClient:
 
@@ -30,12 +31,12 @@ class MCPClient:
     
     def detect_seasonality(self, dataset_id: str) -> Dict[str, Any]:
         y = self._get_data(dataset_id)
-        # For simplicity, we assume daily frequency here. In a real implementation, we would infer this.'
-        return detect_seasonality(dataset_id, y, freq="D")
+        return detect_seasonality_tool(dataset_id, y)
     
-
-    def check_structural_break(self, dataset_id: str) -> Dict[str, Any]:
+    def get_model_complexity_budget(self, dataset_id: str) -> Dict[str, Any]:
         y = self._get_data(dataset_id)
-        return check_structural_break_tool(dataset_id, y)
-    
-    
+        return get_model_complexity_budget_tool(dataset_id, y)
+
+    def estimate_training_cost(self, dataset_id: str, model_class: str, seasonality_period: int = 1) -> Dict[str, Any]:
+        y = self._get_data(dataset_id)
+        return estimate_training_cost_tool(dataset_id, y, model_class, seasonality_period)
