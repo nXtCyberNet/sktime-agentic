@@ -2,12 +2,6 @@
 from typing import Dict, Any
 
 def estimate_training_cost_tool(dataset_id: str, y: np.ndarray, model_class: str, seasonality_period: int = 1) -> Dict[str, Any]:
-    "\""
-    Training tool: Pre-fit cost estimation.
-    Estimates the compute time and USD cost based on algorithm complexity constraints.
-    Incorporates seasonality_period, as seasonal models require vastly larger state spaces.
-    Returns: minutes, cost_usd, recommendation.
-    "\""
     n = len(y)
     
     # Base compute assumptions (e.g., standard Fargate sizing or standard compute instance)
@@ -17,22 +11,27 @@ def estimate_training_cost_tool(dataset_id: str, y: np.ndarray, model_class: str
     # 🧠 Seasonality Penalty Factor
     # Seasonal models have more parameters to estimate. ARIMA expands combinatorially.
     sp_penalty = 1.0
-    if seasonality_period > 1:
+    
+    # Naive and Polynomial don't use seasonality parameters in their base implementations
+    if seasonality_period > 1 and not ("Naive" in model_class or "Polynomial" in model_class):
         if "ARIMA" in model_class:
             # SARIMA permutations multiply the grid search space drastically
             sp_penalty = 4.0 + (seasonality_period * 0.05)
-        elif "ETS" in model_class or "Exponential" in model_class:
+        elif "ETS" in model_class:
+            # ETS state space expands non-linearly with seasonal period
+            sp_penalty = 3.0 + (seasonality_period * 0.04)
+        elif "Exponential" in model_class:
             # Adds strict seasonal states equivalent to the period length
             sp_penalty = 2.0 + (seasonality_period * 0.02)
-        elif "Prophet" in model_class or "BATS" in model_class:
-            # Fourier terms / trigonometric seasonality adds linear-ish overhead
+        elif "Prophet" in model_class or "BATS" in model_class or "Theta" in model_class:
+            # Fourier terms / trigonometric / Theta seasonality adds linear-ish overhead
             sp_penalty = 1.5 + (seasonality_period * 0.01)
         else:
             sp_penalty = 1.2
             
     # Heuristic mapping for standard Sktime scaling properties
     if "Naive" in model_class or "Polynomial" in model_class:
-        minutes += (n * 0.00001)
+        minutes += (n * 0.00001)  # sp_penalty intentionally ignored
     elif "Theta" in model_class:
         minutes += (n * 0.00005) * sp_penalty
     elif "Exponential" in model_class:
