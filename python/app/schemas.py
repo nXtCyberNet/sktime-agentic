@@ -44,4 +44,4 @@ class DataProfile(BaseModel):
     variance: float
 
     def to_natural_language(self) -> str:
-        return f"Time series with {self.length} observations, freq={self.frequency}, missing rate={self.missing_rate:.1%}"\n
+        return f"Time series with {self.length} observations, freq={self.frequency}, missing rate={self.missing_rate:.1%}"

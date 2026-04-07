@@ -5,4 +5,4 @@ class PredictionAgent:
         self.settings = settings
 
     async def predict(self, job, model_version, model_cache):
-        pass\n
+        pass

@@ -18,4 +18,4 @@ class Settings(BaseSettings):
     mlflow_tracking_uri: str = "http://localhost:5000"
     mlflow_artifact_uri: str = "s3://sktime-agentic-models"
     class Config:
-        env_file = ".env"\n
+        env_file = ".env"

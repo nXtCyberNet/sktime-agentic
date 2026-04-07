@@ -5,4 +5,4 @@ class TrainingAgent:
         self.settings = settings
 
     async def handle_retrain_job(self, job):
-        pass\n
+        pass

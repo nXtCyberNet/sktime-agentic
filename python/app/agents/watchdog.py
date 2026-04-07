@@ -6,4 +6,4 @@ class Watchdog:
         self.settings = settings
 
     async def monitor_post_promotion(self, dataset_id: str, baseline_score: float):
-        pass\n
+        pass

@@ -7,4 +7,4 @@ CANDIDATE_ESTIMATORS = [
 ALLOWED_ESTIMATORS = []
 
 def validate_pipeline_spec(spec: dict, registry) -> bool:
-    return True\n
+    return True
