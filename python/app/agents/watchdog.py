@@ -1,33 +1,3 @@
-"""
-Watchdog
-========
-Post-promotion monitor that runs after TrainingAgent promotes a new model.
-
-Responsibilities
-----------------
-1. Poll prediction residuals from Valkey over a configurable observation window.
-2. Compare live model accuracy against the baseline score recorded at promotion
-   time (passed in as `baseline_score`).
-3. If accuracy degrades beyond a configurable threshold, publish a retrain job
-   to the "retrain:jobs" stream (same stream DriftMonitor uses).
-4. Enforce a minimum observation window before rendering a verdict so a newly
-   promoted model isn't rolled back within the first few predictions.
-5. Stop monitoring after the TTL expires or when a retrain job has been queued
-   (one retrain per promotion cycle).
-
-Design constraints
-------------------
-- Watchdog is deliberately narrow in scope: it only compares *aggregate accuracy*
-  against a numeric baseline. Fine-grained residual-pattern analysis (CUSUM,
-  ADWIN) is DriftMonitor's job.
-- The polling loop uses asyncio.sleep to be non-blocking; it does not spawn
-  threads or processes.
-- All retrain locks reuse the same "retrain_lock:{dataset_id}" key as DriftMonitor
-  so the two monitors cannot double-queue a retrain job.
-- Watchdog logs at INFO level for verdict decisions and DEBUG for polling ticks
-  so production logs stay clean.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -56,13 +26,6 @@ _RETRAIN_STREAM  = "retrain:jobs"
 
 
 class Watchdog:
-    """
-    Parameters
-    ----------
-    valkey   : async Valkey/Redis client
-    settings : app.config.Settings
-    """
-
     def __init__(self, valkey, settings):
         self.valkey   = valkey
         self.settings = settings
@@ -84,17 +47,6 @@ class Watchdog:
         baseline_score: float,
         model_version: str | None = None,
     ) -> None:
-        """
-        Begin post-promotion monitoring for *dataset_id*.
-
-        Parameters
-        ----------
-        dataset_id     : Dataset being monitored.
-        baseline_score : Validation MAE recorded by TrainingAgent at promotion time.
-                         Used as the accuracy floor for the newly promoted model.
-        model_version  : Optional model version string. Used to namespace the
-                         residuals Valkey key. Resolved from Valkey if not provided.
-        """
         if baseline_score <= 0:
             logger.error(
                 "Watchdog: invalid baseline_score=%.4f for %s – monitoring aborted",
@@ -188,14 +140,6 @@ class Watchdog:
         predicted: float,
         actual: float,
     ) -> None:
-        """
-        Append a single residual to the Watchdog's Valkey list.
-
-        Called by PredictionAgent / the orchestrator each time an actual value
-        becomes available (e.g. 1-step-ahead evaluation in a streaming pipeline).
-
-        The list is capped at 500 entries to bound memory usage.
-        """
         residual = float(predicted) - float(actual)
         key = _RESIDUALS_KEY.format(dataset_id=dataset_id, model_version=model_version)
 
@@ -240,13 +184,6 @@ class Watchdog:
         baseline_score: float,
         degradation_ratio: float,
     ) -> bool:
-        """
-        Publish a retrain job to the shared "retrain:jobs" stream.
-
-        Uses the same retrain_lock key as DriftMonitor to prevent double-queuing.
-
-        Returns True if the job was queued, False if a lock was already present.
-        """
         lock_key = _RETRAIN_LOCK.format(dataset_id=dataset_id)
 
         try:

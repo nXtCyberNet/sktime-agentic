@@ -90,7 +90,11 @@ class PredictionAgent:
         ForecastResponse
         """
         dataset_id: str = job.dataset_id
-        horizon: int    = getattr(job, "horizon", None) or getattr(self.settings, "default_horizon", _DEFAULT_HORIZON)
+        fh_values: list[int] = list(getattr(job, "fh", []) or [])
+        if not fh_values:
+            default_horizon = int(getattr(self.settings, "default_horizon", _DEFAULT_HORIZON))
+            fh_values = list(range(1, default_horizon + 1))
+
         cache = model_cache if model_cache is not None else self._local_cache
 
         # ---- 1. Resolve model version ----
@@ -104,6 +108,8 @@ class PredictionAgent:
             )
 
         # ---- 2. Load model (from cache or MLflow) ----
+        cache_key = (dataset_id, model_version)
+        cache_hit = cache_key in cache
         model = await self._load_model(dataset_id, model_version, cache)
 
         # ---- 3. Run inference (synchronous, off the event loop) ----
@@ -111,7 +117,7 @@ class PredictionAgent:
         try:
             predictions = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: self._run_inference(model, horizon),
+                lambda: self._run_inference(model, fh_values),
             )
         except Exception as exc:
             logger.error(
@@ -124,19 +130,26 @@ class PredictionAgent:
 
         # ---- 4. Build response ----
         response = ForecastResponse(
-            dataset_id    = dataset_id,
-            model_version = model_version,
-            predictions   = predictions,
-            horizon       = horizon,
-            latency_ms    = round(elapsed_ms, 2),
+            dataset_id=dataset_id,
+            predictions=predictions,
+            prediction_intervals=None,
+            model_version=model_version,
+            model_class=type(model).__name__,
+            model_status="ok",
+            drift_score=None,
+            drift_method=None,
+            warning=None,
+            llm_rationale=f"served_in_ms={round(elapsed_ms, 2)}",
+            cache_hit=cache_hit,
+            correlation_id=job.correlation_id,
         )
 
         # ---- 5. Update Valkey prediction counter (fire-and-forget) ----
         asyncio.ensure_future(self._increment_pred_count(dataset_id))
 
         logger.info(
-            "PredictionAgent: served %d-step forecast for %s v%s in %.1f ms",
-            horizon, dataset_id, model_version, elapsed_ms,
+            "PredictionAgent: served %d-step forecast for %s v%s in %.1f ms (cache_hit=%s)",
+            len(fh_values), dataset_id, model_version, elapsed_ms, cache_hit,
         )
         return response
 
@@ -144,7 +157,7 @@ class PredictionAgent:
     # Inference
     # ------------------------------------------------------------------
 
-    def _run_inference(self, model: Any, horizon: int) -> list[float]:
+    def _run_inference(self, model: Any, fh_values: list[int]) -> list[float]:
         """
         Call the model's predict method.
 
@@ -152,7 +165,7 @@ class PredictionAgent:
         We use the integer form for simplicity; sktime converts it to a
         relative horizon internally.
         """
-        fh = np.arange(1, horizon + 1)
+        fh = np.array(fh_values)
         raw = model.predict(fh)
 
         if hasattr(raw, "values"):

@@ -1,37 +1,3 @@
-"""
-TrainingAgent
-=============
-Fits the candidate estimators produced by ModelSelectorAgent and promotes the
-best one to MLflow's model registry.
-
-Responsibilities
-----------------
-1. Read the ranked candidate list from Valkey (written by ModelSelectorAgent).
-2. Load the training data for the dataset.
-3. For each candidate (in preference order):
-   a. Instantiate the sktime-compatible estimator.
-   b. Fit on the training split.
-   c. Evaluate on the validation split (MAE, MAPE, RMSE).
-   d. Log the run to MLflow.
-   e. Stop early if a model meets the target accuracy threshold.
-4. Register the best model version in the MLflow registry.
-5. Write the new model version string to Valkey so downstream agents (Watchdog,
-   PredictionAgent) can discover it without polling MLflow.
-6. On any unrecoverable error per estimator, log and continue to the next
-   candidate rather than failing the whole job.
-
-Design constraints
-------------------
-- All sktime estimator imports are done lazily (inside _instantiate_estimator)
-  to avoid hard dependencies on every optional package at import time.
-- The agent must be robust to partial failures: if 2 of 3 candidates fail to
-  fit, it must still register the 1 that succeeded.
-- Validation is always performed on a held-out tail split, never on the
-  training portion, to avoid data leakage.
-- MLflow experiment name follows the convention "ts-{dataset_id}" so runs
-  are grouped by dataset in the UI.
-"""
-
 from __future__ import annotations
 
 import importlib
@@ -73,19 +39,6 @@ class TrainingAgent:
     # ------------------------------------------------------------------
 
     async def handle_retrain_job(self, job) -> str | None:
-        """
-        Train all candidate models for the dataset and promote the winner.
-
-        Parameters
-        ----------
-        job : object or dict with .dataset_id / ["dataset_id"]
-
-        Returns
-        -------
-        str | None
-            The MLflow model version string for the promoted model,
-            or None if every candidate failed.
-        """
         dataset_id: str = job.dataset_id if hasattr(job, "dataset_id") else job["dataset_id"]
         reason: str     = getattr(job, "reason", job.get("reason", "scheduled") if isinstance(job, dict) else "scheduled")
 
@@ -171,11 +124,6 @@ class TrainingAgent:
         experiment_name: str,
         reason: str,
     ) -> dict[str, Any] | None:
-        """
-        Fit a single estimator, evaluate it, and log the MLflow run.
-
-        Returns None on any unrecoverable error (so the caller can skip ahead).
-        """
         logger.info("TrainingAgent: fitting %s for %s", estimator_name, dataset_id)
         t0 = time.monotonic()
 
@@ -249,14 +197,6 @@ class TrainingAgent:
     # ------------------------------------------------------------------
 
     def _instantiate_estimator(self, name: str, n_train: int) -> Any:
-        """
-        Lazily import and instantiate a sktime-compatible estimator by class name.
-
-        Raises
-        ------
-        ImportError  – package not installed
-        ValueError   – unknown estimator name
-        """
         # Module paths for each known estimator class name
         _ESTIMATOR_MAP = {
             "NaiveForecaster": (
@@ -317,11 +257,6 @@ class TrainingAgent:
             return None
 
     def _register_model(self, dataset_id: str, best: dict[str, Any]) -> str | None:
-        """
-        Register the best model run in the MLflow model registry.
-
-        Returns the version string (e.g. "3") or None on failure.
-        """
         model_name = f"ts-forecaster-{dataset_id}"
         run_id     = best.get("run_id")
 
@@ -351,12 +286,6 @@ class TrainingAgent:
     # ------------------------------------------------------------------
 
     def _load_data(self, dataset_id: str) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Load the dataset and split into train / validation.
-
-        In production this would call a DataLoader or query a feature store.
-        Here we use the MCPClient's internal loader as the single source of truth.
-        """
         # Reuse settings-injected loader if available
         loader = getattr(self.settings, "data_loader", None)
         if loader is not None:
