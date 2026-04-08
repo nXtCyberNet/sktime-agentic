@@ -1,9 +1,299 @@
+"""
+Watchdog
+========
+Post-promotion monitor that runs after TrainingAgent promotes a new model.
+
+Responsibilities
+----------------
+1. Poll prediction residuals from Valkey over a configurable observation window.
+2. Compare live model accuracy against the baseline score recorded at promotion
+   time (passed in as `baseline_score`).
+3. If accuracy degrades beyond a configurable threshold, publish a retrain job
+   to the "retrain:jobs" stream (same stream DriftMonitor uses).
+4. Enforce a minimum observation window before rendering a verdict so a newly
+   promoted model isn't rolled back within the first few predictions.
+5. Stop monitoring after the TTL expires or when a retrain job has been queued
+   (one retrain per promotion cycle).
+
+Design constraints
+------------------
+- Watchdog is deliberately narrow in scope: it only compares *aggregate accuracy*
+  against a numeric baseline. Fine-grained residual-pattern analysis (CUSUM,
+  ADWIN) is DriftMonitor's job.
+- The polling loop uses asyncio.sleep to be non-blocking; it does not spawn
+  threads or processes.
+- All retrain locks reuse the same "retrain_lock:{dataset_id}" key as DriftMonitor
+  so the two monitors cannot double-queue a retrain job.
+- Watchdog logs at INFO level for verdict decisions and DEBUG for polling ticks
+  so production logs stay clean.
+"""
+
+from __future__ import annotations
+
 import asyncio
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Any
+
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Configuration defaults (overridden by settings when present)
+# ---------------------------------------------------------------------------
+_DEFAULT_POLL_INTERVAL_S    = 30        # seconds between Valkey polls
+_DEFAULT_OBSERVATION_WINDOW = 50        # minimum predictions before verdict
+_DEFAULT_MONITOR_TTL_S      = 3600      # give up after 1 h regardless
+_DEFAULT_DEGRADATION_THRESH = 0.25      # 25 % increase in MAE triggers retrain
+_RETRAIN_LOCK_TTL_S         = 600       # 10 min lock – same as DriftMonitor default
+
+# Valkey key conventions (must match TrainingAgent / DriftMonitor)
+_RESIDUALS_KEY   = "watchdog:residuals:{dataset_id}:{model_version}"
+_RETRAIN_LOCK    = "retrain_lock:{dataset_id}"
+_RETRAIN_STREAM  = "retrain:jobs"
+
 
 class Watchdog:
+    """
+    Parameters
+    ----------
+    valkey   : async Valkey/Redis client
+    settings : app.config.Settings
+    """
+
     def __init__(self, valkey, settings):
-        self.valkey = valkey
+        self.valkey   = valkey
         self.settings = settings
 
-    async def monitor_post_promotion(self, dataset_id: str, baseline_score: float):
-        pass
+        # Read optional overrides from settings
+        self._poll_interval   = getattr(settings, "watchdog_poll_interval_s",   _DEFAULT_POLL_INTERVAL_S)
+        self._min_obs         = getattr(settings, "watchdog_min_observations",  _DEFAULT_OBSERVATION_WINDOW)
+        self._ttl             = getattr(settings, "watchdog_monitor_ttl_s",     _DEFAULT_MONITOR_TTL_S)
+        self._degrad_thresh   = getattr(settings, "watchdog_degradation_thresh", _DEFAULT_DEGRADATION_THRESH)
+        self._lock_ttl        = getattr(settings, "retrain_lock_ttl_seconds",   _RETRAIN_LOCK_TTL_S)
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    async def monitor_post_promotion(
+        self,
+        dataset_id: str,
+        baseline_score: float,
+        model_version: str | None = None,
+    ) -> None:
+        """
+        Begin post-promotion monitoring for *dataset_id*.
+
+        Parameters
+        ----------
+        dataset_id     : Dataset being monitored.
+        baseline_score : Validation MAE recorded by TrainingAgent at promotion time.
+                         Used as the accuracy floor for the newly promoted model.
+        model_version  : Optional model version string. Used to namespace the
+                         residuals Valkey key. Resolved from Valkey if not provided.
+        """
+        if baseline_score <= 0:
+            logger.error(
+                "Watchdog: invalid baseline_score=%.4f for %s – monitoring aborted",
+                baseline_score, dataset_id,
+            )
+            return
+
+        if model_version is None:
+            model_version = await self._resolve_model_version(dataset_id)
+        if model_version is None:
+            logger.warning("Watchdog: cannot resolve model version for %s – monitoring aborted", dataset_id)
+            return
+
+        logger.info(
+            "Watchdog: starting post-promotion monitoring for %s v%s (baseline_mae=%.4f, ttl=%ds)",
+            dataset_id, model_version, baseline_score, self._ttl,
+        )
+
+        start_time = asyncio.get_event_loop().time()
+        retrain_queued = False
+
+        while not retrain_queued:
+            # ---- Check TTL ----
+            elapsed = asyncio.get_event_loop().time() - start_time
+            if elapsed >= self._ttl:
+                logger.info(
+                    "Watchdog: TTL expired for %s v%s after %.0f s – stopping",
+                    dataset_id, model_version, elapsed,
+                )
+                break
+
+            # ---- Poll residuals ----
+            residuals = await self._fetch_residuals(dataset_id, model_version)
+            n_obs = len(residuals)
+
+            if n_obs < self._min_obs:
+                logger.debug(
+                    "Watchdog: %s v%s — waiting for minimum observations (%d/%d)",
+                    dataset_id, model_version, n_obs, self._min_obs,
+                )
+                await asyncio.sleep(self._poll_interval)
+                continue
+
+            # ---- Compute live MAE ----
+            live_mae = float(np.mean(np.abs(residuals)))
+            degradation_ratio = (live_mae - baseline_score) / max(baseline_score, 1e-8)
+
+            logger.info(
+                "Watchdog: %s v%s — live_mae=%.4f baseline_mae=%.4f degradation=%.1f%% (n=%d)",
+                dataset_id, model_version,
+                live_mae, baseline_score,
+                degradation_ratio * 100,
+                n_obs,
+            )
+
+            # ---- Verdict ----
+            if degradation_ratio > self._degrad_thresh:
+                logger.warning(
+                    "Watchdog: DEGRADATION DETECTED for %s v%s — "
+                    "live_mae=%.4f exceeds baseline=%.4f by %.1f%% (threshold=%.1f%%)",
+                    dataset_id, model_version,
+                    live_mae, baseline_score,
+                    degradation_ratio * 100,
+                    self._degrad_thresh * 100,
+                )
+                retrain_queued = await self._queue_retrain(
+                    dataset_id=dataset_id,
+                    model_version=model_version,
+                    live_mae=live_mae,
+                    baseline_score=baseline_score,
+                    degradation_ratio=degradation_ratio,
+                )
+            else:
+                logger.debug(
+                    "Watchdog: %s v%s — accuracy within threshold (degradation=%.1f%%)",
+                    dataset_id, model_version, degradation_ratio * 100,
+                )
+
+            await asyncio.sleep(self._poll_interval)
+
+        logger.info("Watchdog: monitoring complete for %s v%s", dataset_id, model_version)
+
+    # ------------------------------------------------------------------
+    # Residual collection
+    # ------------------------------------------------------------------
+
+    async def record_residual(
+        self,
+        dataset_id: str,
+        model_version: str,
+        predicted: float,
+        actual: float,
+    ) -> None:
+        """
+        Append a single residual to the Watchdog's Valkey list.
+
+        Called by PredictionAgent / the orchestrator each time an actual value
+        becomes available (e.g. 1-step-ahead evaluation in a streaming pipeline).
+
+        The list is capped at 500 entries to bound memory usage.
+        """
+        residual = float(predicted) - float(actual)
+        key = _RESIDUALS_KEY.format(dataset_id=dataset_id, model_version=model_version)
+
+        try:
+            pipe = self.valkey.pipeline()
+            pipe.rpush(key, str(residual))
+            pipe.ltrim(key, -500, -1)   # keep only the most recent 500 entries
+            pipe.expire(key, self._ttl)
+            await pipe.execute()
+        except Exception as exc:
+            logger.warning("Watchdog.record_residual: Valkey write failed for %s: %s", dataset_id, exc)
+
+    async def _fetch_residuals(self, dataset_id: str, model_version: str) -> np.ndarray:
+        """Retrieve all residuals for this (dataset_id, model_version) from Valkey."""
+        key = _RESIDUALS_KEY.format(dataset_id=dataset_id, model_version=model_version)
+        try:
+            raw_list = await self.valkey.lrange(key, 0, -1)
+            if not raw_list:
+                return np.array([], dtype=float)
+            values = []
+            for item in raw_list:
+                try:
+                    v = float(item.decode() if isinstance(item, bytes) else item)
+                    if np.isfinite(v):
+                        values.append(v)
+                except (ValueError, TypeError):
+                    continue
+            return np.array(values, dtype=float)
+        except Exception as exc:
+            logger.warning("Watchdog: Valkey residual fetch failed for %s: %s", dataset_id, exc)
+            return np.array([], dtype=float)
+
+    # ------------------------------------------------------------------
+    # Retrain queue
+    # ------------------------------------------------------------------
+
+    async def _queue_retrain(
+        self,
+        dataset_id: str,
+        model_version: str,
+        live_mae: float,
+        baseline_score: float,
+        degradation_ratio: float,
+    ) -> bool:
+        """
+        Publish a retrain job to the shared "retrain:jobs" stream.
+
+        Uses the same retrain_lock key as DriftMonitor to prevent double-queuing.
+
+        Returns True if the job was queued, False if a lock was already present.
+        """
+        lock_key = _RETRAIN_LOCK.format(dataset_id=dataset_id)
+
+        try:
+            already_locked = await self.valkey.exists(lock_key)
+            if already_locked:
+                logger.info(
+                    "Watchdog: retrain already queued for %s (lock present) – skipping",
+                    dataset_id,
+                )
+                return False
+
+            await self.valkey.setex(lock_key, self._lock_ttl, "1")
+
+            await self.valkey.xadd(
+                _RETRAIN_STREAM,
+                {
+                    "dataset_id":         dataset_id,
+                    "model_version":      model_version,
+                    "reason":             "watchdog_degradation",
+                    "live_mae":           str(round(live_mae, 6)),
+                    "baseline_mae":       str(round(baseline_score, 6)),
+                    "degradation_ratio":  str(round(degradation_ratio, 4)),
+                    "triggered_at":       datetime.now(tz=timezone.utc).isoformat(),
+                },
+            )
+
+            logger.info(
+                "Watchdog: queued retrain job for %s (live_mae=%.4f vs baseline=%.4f)",
+                dataset_id, live_mae, baseline_score,
+            )
+            return True
+
+        except Exception as exc:
+            logger.error("Watchdog: failed to queue retrain for %s: %s", dataset_id, exc)
+            return False
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def _resolve_model_version(self, dataset_id: str) -> str | None:
+        """Read the active model version from Valkey (set by TrainingAgent)."""
+        key = f"model_version:{dataset_id}"
+        try:
+            raw = await self.valkey.get(key)
+            if raw:
+                return raw.decode() if isinstance(raw, bytes) else raw
+        except Exception as exc:
+            logger.warning("Watchdog: cannot read model version for %s: %s", dataset_id, exc)
+        return None
