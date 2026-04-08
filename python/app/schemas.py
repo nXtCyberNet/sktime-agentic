@@ -1,6 +1,10 @@
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from __future__ import annotations
+
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
 
 class ForecastRequest(BaseModel):
     dataset_id: str
@@ -8,12 +12,13 @@ class ForecastRequest(BaseModel):
     correlation_id: str
     frequency: Optional[str] = None
 
-    @field_validator('fh')
+    @field_validator("fh")
     @classmethod
     def fh_must_be_positive(cls, v: List[int]) -> List[int]:
         if any(h <= 0 for h in v):
-            raise ValueError('all horizon values must be positive integers')
+            raise ValueError("all horizon values must be positive integers")
         return v
+
 
 class ForecastResponse(BaseModel):
     dataset_id: str
@@ -29,13 +34,15 @@ class ForecastResponse(BaseModel):
     cache_hit: bool
     correlation_id: str
 
+
 class RetrainJob(BaseModel):
     dataset_id: str
     reason: str
     triggered_at: datetime
 
+
 class DataProfile(BaseModel):
-    # New architecture fields
+    # ---- New-architecture fields ----
     dataset_id: str
     n_observations: Optional[int] = None
     narrative: str = ""
@@ -46,7 +53,7 @@ class DataProfile(BaseModel):
     dataset_history: Dict[str, Any] = Field(default_factory=dict)
     training_costs: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
-    # Legacy fields kept for backward compatibility
+    # ---- Legacy fields kept for backward compatibility ----
     length: Optional[int] = None
     frequency: Optional[str] = None
     has_seasonality: Optional[bool] = None
@@ -57,22 +64,30 @@ class DataProfile(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     @model_validator(mode="after")
-    def _hydrate_legacy_and_new_fields(self):
+    def _hydrate_legacy_and_new_fields(self) -> "DataProfile":
+        # Keep n_observations and length in sync
         if self.n_observations is None and self.length is not None:
             self.n_observations = self.length
         if self.length is None and self.n_observations is not None:
             self.length = self.n_observations
 
+        # Derive convenience booleans from sub-dicts when not set explicitly
         if self.has_seasonality is None:
-            self.has_seasonality = bool(self.seasonality.get("seasonality_class") not in (None, "none"))
+            self.has_seasonality = bool(
+                self.seasonality.get("seasonality_class") not in (None, "none")
+            )
         if self.is_stationary is None:
             self.is_stationary = bool(self.stationarity.get("is_stationary", False))
 
         return self
 
     def to_natural_language(self) -> str:
+        """Human-readable one-liner used in logging and LLM context."""
         observations = self.n_observations if self.n_observations is not None else self.length
+        seasonality_str = "yes" if self.has_seasonality else "no"
+        stationary_str = "yes" if self.is_stationary else "no"
         return (
             f"Time series with {observations} observations, freq={self.frequency}, "
+            f"seasonality={seasonality_str}, stationary={stationary_str}, "
             f"missing rate={self.missing_rate:.1%}"
         )

@@ -10,14 +10,21 @@ from app.schemas import DataProfile
 
 logger = logging.getLogger(__name__)
 
-
-# Valkey key helpers
 _PROFILE_KEY   = "profile:{dataset_id}"
 _CANDIDATE_KEY = "candidates:{dataset_id}"
 _CANDIDATE_TTL = 3600  # seconds
 
 
 class ModelSelectorAgent:
+    """
+    Parameters
+    ----------
+    valkey        : async Valkey/Redis client
+    mlflow_client : synchronous MlflowClient (for querying only)
+    mcp_client    : app.mcp.client.MCPClient
+    settings      : app.config.Settings
+    """
+
     def __init__(self, valkey, mlflow_client, mcp_client, settings):
         self.valkey   = valkey
         self.mlflow   = mlflow_client
@@ -29,7 +36,22 @@ class ModelSelectorAgent:
     # ------------------------------------------------------------------
 
     async def select(self, job) -> list[str]:
-        dataset_id: str = job.dataset_id if hasattr(job, "dataset_id") else job["dataset_id"]
+        """
+        Main entry point called by the orchestrator.
+
+        Parameters
+        ----------
+        job : ForecastRequest or dict — must have a .dataset_id attribute
+              or ["dataset_id"] key.
+
+        Returns
+        -------
+        List of estimator class names in preference order, e.g.
+        ["AutoARIMA", "ExponentialSmoothing", "NaiveForecaster"]
+        """
+        dataset_id: str = (
+            job.dataset_id if hasattr(job, "dataset_id") else job["dataset_id"]
+        )
         logger.info("ModelSelectorAgent.select: starting for dataset_id=%s", dataset_id)
 
         # ---- 1. Load DataProfile from Valkey ----
@@ -41,12 +63,11 @@ class ModelSelectorAgent:
         # ---- 3. Ask the LLM ----
         raw_candidates: list[str] = await self._llm_select(profile, mlflow_context)
 
-        # ---- 4. Strip forbidden models (hard constraint – never delegated to LLM) ----
+        # ---- 4. Strip forbidden models — hard Python constraint, never delegated ----
         forbidden: set[str] = set(profile.complexity_budget.get("forbidden_models", []))
         candidates = [m for m in raw_candidates if m not in forbidden]
 
         if not candidates:
-            # Absolute fallback: cheapest permitted model
             permitted = profile.complexity_budget.get("permitted_models", ["NaiveForecaster"])
             candidates = permitted[:1]
             logger.warning(
@@ -58,7 +79,10 @@ class ModelSelectorAgent:
         # ---- 5. Persist to Valkey ----
         key = _CANDIDATE_KEY.format(dataset_id=dataset_id)
         await self.valkey.setex(key, _CANDIDATE_TTL, json.dumps(candidates))
-        logger.info("ModelSelectorAgent: wrote %d candidates for %s → %s", len(candidates), dataset_id, candidates)
+        logger.info(
+            "ModelSelectorAgent: wrote %d candidates for %s → %s",
+            len(candidates), dataset_id, candidates,
+        )
 
         return candidates
 
@@ -71,30 +95,37 @@ class ModelSelectorAgent:
         profile: DataProfile,
         mlflow_context: dict[str, Any] | None = None,
     ) -> list[str]:
-        system_prompt = (
-            "You are a time-series model selection expert embedded in an automated ML pipeline. "
-            "Your sole output must be a JSON array of estimator class names, ranked from most "
-            "preferred to least preferred. Do not include any explanation, markdown, or text "
-            "outside the JSON array."
-            "Rules you must follow:"
-            "1. Only recommend estimators from the permitted_models list in the complexity budget."
-            "2. Never recommend an estimator that appears in failed_estimators with failure_count > 1 "
-            "   unless all permitted alternatives have also failed."
-            "3. If the series has a structural break (break_detected=true), prefer models that handle "
-            "   changepoints natively (Prophet) or are robust to level shifts (NaiveForecaster, "
-            "   ExponentialSmoothing) over ARIMA-family models."
-            "4. If the series is non-stationary (is_stationary=false), prefer models that do not "
-            "   require stationarity (Prophet, ExponentialSmoothing, NaiveForecaster) unless "
-            "   AutoARIMA is permitted and no structural break is present."
-            "5. If seasonality is strong (seasonality_class=strong), prefer models that model "
-            "   seasonality explicitly (Prophet, TBATS, ExponentialSmoothing with seasonal_periods, "
-            "   AutoARIMA with seasonal=True)."
-            "6. Always include at least one simple baseline (NaiveForecaster or "
-            "   PolynomialTrendForecaster) at the end of the list as a last-resort fallback."
-            "7. Return between 2 and 5 estimators."
-        )
+        """
+        Send the full DataProfile to the configured LLM and parse a ranked
+        list of estimator class names from the response.
 
-        # Build a single, self-contained user message with all evidence
+        On any error (transport, parse, etc.) falls back gracefully to the
+        full permitted list from the complexity budget.
+        """
+        system_prompt = "\n".join([
+            "You are a time-series model selection expert embedded in an automated ML pipeline.",
+            "Your sole output must be a JSON array of estimator class names, ranked from most",
+            "preferred to least preferred. Do not include any explanation, markdown, or text",
+            "outside the JSON array.",
+            "",
+            "Rules you must follow:",
+            "1. Only recommend estimators from the permitted_models list in the complexity budget.",
+            "2. Never recommend an estimator that appears in failed_estimators with failure_count > 1",
+            "   unless all permitted alternatives have also failed.",
+            "3. If the series has a structural break (break_detected=true), prefer models that handle",
+            "   changepoints natively (Prophet) or are robust to level shifts (NaiveForecaster,",
+            "   ExponentialSmoothing) over ARIMA-family models.",
+            "4. If the series is non-stationary (is_stationary=false), prefer models that do not",
+            "   require stationarity (Prophet, ExponentialSmoothing, NaiveForecaster) unless",
+            "   AutoARIMA is permitted and no structural break is present.",
+            "5. If seasonality is strong (seasonality_class=strong), prefer models that model",
+            "   seasonality explicitly (Prophet, TBATS, ExponentialSmoothing with seasonal_periods,",
+            "   AutoARIMA with seasonal=True).",
+            "6. Always include at least one simple baseline (NaiveForecaster or",
+            "   PolynomialTrendForecaster) at the end of the list as a last-resort fallback.",
+            "7. Return between 2 and 5 estimators.",
+        ])
+
         evidence = {
             "dataset_id":        profile.dataset_id,
             "n_observations":    profile.n_observations,
@@ -118,8 +149,7 @@ class ModelSelectorAgent:
         except Exception as exc:
             logger.error(
                 "ModelSelectorAgent._llm_select: LLM HTTP request failed for %s: %s",
-                profile.dataset_id,
-                exc,
+                profile.dataset_id, exc,
             )
             return profile.complexity_budget.get("permitted_models", ["NaiveForecaster"])
 
@@ -131,54 +161,68 @@ class ModelSelectorAgent:
                 "Raw response: %s",
                 profile.dataset_id, exc, raw_text,
             )
-            # Graceful degradation: return the full permitted list in complexity order
             return profile.complexity_budget.get("permitted_models", ["NaiveForecaster"])
 
     async def _request_llm_text(self, system_prompt: str, user_message: str) -> str:
+        """Fire the HTTP request and return the raw text content from the response."""
         url, headers, payload = self._build_llm_request(system_prompt, user_message)
         timeout_seconds = float(getattr(self.settings, "llm_timeout_seconds", 30.0))
 
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.post(url, headers=headers, json=payload)
+            # raise_for_status() must be called INSIDE the async-with block
+            # while the response object is still open.
+            response.raise_for_status()
+            body = response.json()
 
-        response.raise_for_status()
-        body = response.json()
-        raw_text = self._extract_text_from_response(body)
-        return raw_text.strip()
+        return self._extract_text_from_response(body).strip()
 
     def _build_llm_request(
         self,
         system_prompt: str,
         user_message: str,
     ) -> tuple[str, dict[str, str], dict[str, Any]]:
-        provider = str(getattr(self.settings, "llm_provider", "openai_compatible")).strip().lower()
-        model = str(getattr(self.settings, "llm_model", "gpt-4o-mini")).strip()
-        max_tokens = int(getattr(self.settings, "llm_max_tokens", 256))
-        api_key = str(
+        """
+        Build (url, headers, payload) for the configured LLM provider.
+
+        Supports two provider modes:
+        - "anthropic"        → Anthropic Messages API format
+        - "openai_compatible" (default) → OpenAI Chat Completions format
+        """
+        provider   = str(getattr(self.settings, "llm_provider",   "openai_compatible")).strip().lower()
+        model      = str(getattr(self.settings, "llm_model",       "gpt-4o-mini")).strip()
+        max_tokens = int(getattr(self.settings, "llm_max_tokens",  256))
+        api_key    = str(
             getattr(self.settings, "llm_api_key", "")
             or getattr(self.settings, "anthropic_api_key", "")
         ).strip()
 
         if provider == "anthropic":
-            url = str(getattr(self.settings, "llm_api_url", "")).strip() or "https://api.anthropic.com/v1/messages"
+            url = (
+                str(getattr(self.settings, "llm_api_url", "")).strip()
+                or "https://api.anthropic.com/v1/messages"
+            )
             version = str(getattr(self.settings, "llm_api_version", "2023-06-01")).strip()
-            headers = {
-                "Content-Type": "application/json",
+            headers: dict[str, str] = {
+                "Content-Type":      "application/json",
                 "anthropic-version": version,
             }
             if api_key:
                 headers["x-api-key"] = api_key
 
-            payload = {
-                "model": model,
+            payload: dict[str, Any] = {
+                "model":      model,
                 "max_tokens": max_tokens,
-                "system": system_prompt,
-                "messages": [{"role": "user", "content": user_message}],
+                "system":     system_prompt,
+                "messages":   [{"role": "user", "content": user_message}],
             }
             return url, headers, payload
 
-        # Default to OpenAI-compatible Chat Completions payload used by many providers.
-        url = str(getattr(self.settings, "llm_api_url", "")).strip() or "https://api.openai.com/v1/chat/completions"
+        # ---- OpenAI-compatible (default) ----
+        url = (
+            str(getattr(self.settings, "llm_api_url", "")).strip()
+            or "https://api.openai.com/v1/chat/completions"
+        )
         headers = {"Content-Type": "application/json"}
         auth_header = str(getattr(self.settings, "llm_auth_header", "Authorization")).strip()
         auth_scheme = str(getattr(self.settings, "llm_auth_scheme", "Bearer")).strip()
@@ -190,25 +234,33 @@ class ModelSelectorAgent:
         extra_headers_json = str(getattr(self.settings, "llm_extra_headers_json", "")).strip()
         if extra_headers_json:
             try:
-                extra_headers = json.loads(extra_headers_json)
-                if isinstance(extra_headers, dict):
-                    headers.update({str(k): str(v) for k, v in extra_headers.items()})
+                extra = json.loads(extra_headers_json)
+                if isinstance(extra, dict):
+                    headers.update({str(k): str(v) for k, v in extra.items()})
             except json.JSONDecodeError:
                 logger.warning("ModelSelectorAgent: invalid llm_extra_headers_json; ignoring")
 
         payload = {
-            "model": model,
-            "max_tokens": max_tokens,
+            "model":       model,
+            "max_tokens":  max_tokens,
             "temperature": 0,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
+                {"role": "user",   "content": user_message},
             ],
         }
         return url, headers, payload
 
     def _extract_text_from_response(self, body: dict[str, Any]) -> str:
-        # OpenAI-compatible: {"choices": [{"message": {"content": "..."}}]}
+        """
+        Extract the text string from a provider response body.
+
+        Handles three shapes:
+        - OpenAI:    {"choices": [{"message": {"content": "..."}}]}
+        - Anthropic: {"content": [{"type": "text", "text": "..."}]}
+        - Fallback:  {"output_text": "..."} or {"text": "..."}
+        """
+        # OpenAI-compatible
         choices = body.get("choices")
         if isinstance(choices, list) and choices:
             first = choices[0]
@@ -222,61 +274,66 @@ class ModelSelectorAgent:
                 if isinstance(text, str) and text.strip():
                     return text
 
-        # Anthropic-style: {"content": [{"type": "text", "text": "..."}]}
+        # Anthropic-style
         text = self._content_to_text(body.get("content"))
         if text:
             return text
 
-        output_text = body.get("output_text")
-        if isinstance(output_text, str) and output_text.strip():
-            return output_text
+        # Generic fallbacks
+        for key in ("output_text", "text"):
+            raw = body.get(key)
+            if isinstance(raw, str) and raw.strip():
+                return raw
 
-        raw_text = body.get("text")
-        if isinstance(raw_text, str) and raw_text.strip():
-            return raw_text
-
-        raise ValueError("Unsupported LLM response format: no text content found")
+        raise ValueError(f"Unsupported LLM response format: no text content found in body keys {list(body)}")
 
     @staticmethod
     def _content_to_text(content: Any) -> str:
+        """Collapse a content field (str or list-of-blocks) to a plain string."""
         if isinstance(content, str):
             return content
-
         if isinstance(content, list):
             parts: list[str] = []
             for block in content:
                 if isinstance(block, str):
                     parts.append(block)
-                    continue
-                if isinstance(block, dict):
+                elif isinstance(block, dict):
                     text = block.get("text")
                     if isinstance(text, str):
                         parts.append(text)
-            return "\n".join(part for part in parts if part)
-
+            return "\n".join(p for p in parts if p)
         return ""
 
     @staticmethod
     def _parse_candidate_response(raw_text: str) -> list[str]:
+        """
+        Parse the LLM response into a list of estimator class name strings.
+
+        Accepts:
+        - A bare JSON array:  ["AutoARIMA", "Prophet", "NaiveForecaster"]
+        - A JSON object with a known list key (candidates / ranked / estimators / models)
+        """
         parsed = json.loads(raw_text)
 
         if isinstance(parsed, list):
-            return [str(candidate) for candidate in parsed]
+            return [str(c) for c in parsed]
 
         if isinstance(parsed, dict):
             for key in ("candidates", "ranked", "estimators", "models"):
                 value = parsed.get(key)
                 if isinstance(value, list):
-                    return [str(candidate) for candidate in value]
+                    return [str(c) for c in value]
 
-        raise ValueError("Expected a JSON array of estimator class names")
+        raise ValueError(
+            f"Expected a JSON array of estimator class names, got: {type(parsed).__name__}"
+        )
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
     async def _load_profile(self, dataset_id: str) -> DataProfile:
-        """Load DataProfile written by PipelineArchitectAgent from Valkey."""
+        """Load the DataProfile written by PipelineArchitectAgent from Valkey."""
         key = _PROFILE_KEY.format(dataset_id=dataset_id)
         raw = await self.valkey.get(key)
         if not raw:
@@ -288,20 +345,30 @@ class ModelSelectorAgent:
         return DataProfile(**data)
 
     def _fetch_mlflow_context(self, dataset_id: str) -> dict[str, Any]:
+        """
+        Query the MLflow registry for previously registered model versions on
+        this dataset.
+
+        Returns
+        -------
+        dict with keys:
+            registered_versions : list of {version, run_id, estimator, val_mae, status}
+            best_mae            : float | None  — best validation MAE seen so far
+        """
         try:
             versions = self.mlflow.search_model_versions(f"tags.dataset_id='{dataset_id}'")
-            parsed = []
-            best_mae = None
+            parsed: list[dict[str, Any]] = []
+            best_mae: float | None = None
 
             for v in versions:
-                run = self.mlflow.get_run(v.run_id)
-                mae = run.data.metrics.get("val_mae")
+                run  = self.mlflow.get_run(v.run_id)
+                mae  = run.data.metrics.get("val_mae")
                 parsed.append({
-                    "version":    v.version,
-                    "run_id":     v.run_id,
-                    "estimator":  run.data.tags.get("estimator", "unknown"),
-                    "val_mae":    mae,
-                    "status":     v.status,
+                    "version":   v.version,
+                    "run_id":    v.run_id,
+                    "estimator": run.data.tags.get("estimator", "unknown"),
+                    "val_mae":   mae,
+                    "status":    v.status,
                 })
                 if mae is not None and (best_mae is None or mae < best_mae):
                     best_mae = mae
@@ -309,5 +376,7 @@ class ModelSelectorAgent:
             return {"registered_versions": parsed, "best_mae": best_mae}
 
         except Exception as exc:
-            logger.warning("ModelSelectorAgent: MLflow query failed for %s: %s", dataset_id, exc)
+            logger.warning(
+                "ModelSelectorAgent: MLflow query failed for %s: %s", dataset_id, exc
+            )
             return {"registered_versions": [], "best_mae": None}

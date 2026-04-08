@@ -1,5 +1,7 @@
-﻿import numpy as np
-from typing import Dict, Any, List, Optional
+﻿from __future__ import annotations
+
+import numpy as np
+from typing import Dict, Any, Optional
 
 from .check_structural_break import check_structural_break_tool
 from .run_stationarity_test import run_stationarity_test_tool
@@ -11,9 +13,9 @@ from .get_dataset_history import get_dataset_history_tool
 
 class MCPClient:
     def __init__(self, data_loader=None, memory_loader=None):
-        # data_loader: callable (dataset_id: str) -> np.ndarray
-        self.data_loader = data_loader
-        # memory_loader: callable (dataset_id: str) -> Dict[str, Any]
+        # data_loader   : callable(dataset_id: str) -> np.ndarray
+        self.data_loader   = data_loader
+        # memory_loader : callable(dataset_id: str) -> Dict[str, Any]
         self.memory_loader = memory_loader
 
     # ------------------------------------------------------------------
@@ -23,8 +25,11 @@ class MCPClient:
     def _get_data(self, dataset_id: str) -> np.ndarray:
         if self.data_loader:
             return self.data_loader(dataset_id)
-        # Safe deterministic mock for unit tests — not random so tests are repeatable
-        rng = np.random.default_rng(seed=42)
+        # Deterministic mock — seed from dataset_id hash so different datasets
+        # produce different series. The original always used seed=42, which
+        # masked bugs in dataset-specific branching logic during tests.
+        seed = int(hash(dataset_id) % 2**31)
+        rng  = np.random.default_rng(seed=seed)
         return rng.standard_normal(100)
 
     def _get_memory(self, dataset_id: str) -> Dict[str, Any]:
@@ -34,21 +39,16 @@ class MCPClient:
 
     # ------------------------------------------------------------------
     # profile_dataset — full diagnostic dashboard, single call
-    #
-    # The PipelineArchitectAgent calls this first to get the complete
-    # picture in one shot. Individual tools exist for targeted drill-down
-    # when the agent needs to investigate a specific dimension more deeply.
     # ------------------------------------------------------------------
 
     def profile_dataset(self, dataset_id: str, freq: Optional[str] = None) -> Dict[str, Any]:
         y = self._get_data(dataset_id)
 
-        stationarity = run_stationarity_test_tool(dataset_id, y)
-        seasonality = detect_seasonality_tool(dataset_id, y, freq=freq)
-        structural_break = check_structural_break_tool(dataset_id, y)
+        stationarity      = run_stationarity_test_tool(dataset_id, y)
+        seasonality       = detect_seasonality_tool(dataset_id, y, freq=freq)
+        structural_break  = check_structural_break_tool(dataset_id, y)
         complexity_budget = get_model_complexity_budget_tool(dataset_id, y)
 
-        # Build a single plain-English narrative the LLM can reason from directly
         narrative_parts = [
             f"Dataset '{dataset_id}' contains {len(y)} observations.",
             f"Stationarity: {stationarity['conclusion']} "
@@ -63,24 +63,22 @@ class MCPClient:
                 if structural_break["break_detected"]
                 else "Structural break: NOT detected."
             ),
-            f"Permitted model tiers for this dataset size: {', '.join(complexity_budget['permitted_models'])}.",
+            f"Permitted model tiers for this dataset size: "
+            f"{', '.join(complexity_budget['permitted_models'])}.",
         ]
 
         return {
-            "dataset_id": dataset_id,
-            "n_observations": len(y),
-            "narrative": " ".join(narrative_parts),
-            # Full sub-results preserved — agent can inspect any field
-            "stationarity": stationarity,
-            "seasonality": seasonality,
+            "dataset_id":      dataset_id,
+            "n_observations":  len(y),
+            "narrative":       " ".join(narrative_parts),
+            "stationarity":    stationarity,
+            "seasonality":     seasonality,
             "structural_break": structural_break,
             "complexity_budget": complexity_budget,
-            # No suggested_next_tools here — after profile_dataset the LLM has the
-            # full picture and should decide autonomously what to investigate further.
         }
 
     # ------------------------------------------------------------------
-    # Individual tools — for targeted drill-down after profile_dataset
+    # Individual tools — targeted drill-down
     # ------------------------------------------------------------------
 
     def get_dataset_history(self, dataset_id: str) -> Dict[str, Any]:

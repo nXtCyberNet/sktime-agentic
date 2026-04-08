@@ -1,23 +1,75 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import logging
 import time
 from typing import Any
 
+import mlflow
+import mlflow.pyfunc
+import mlflow.sklearn
 import numpy as np
+import pandas as pd
+from sktime.forecasting.base import ForecastingHorizon
+from sktime.performance_metrics.forecasting import (
+    MeanAbsoluteError,
+    MeanAbsolutePercentageError,
+    MeanSquaredError,
+)
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Valkey key helpers
-# ---------------------------------------------------------------------------
 _CANDIDATE_KEY   = "candidates:{dataset_id}"
 _MODEL_VER_KEY   = "model_version:{dataset_id}"
-_MODEL_VER_TTL   = 86_400          # 24 h
-_VALIDATION_FRAC = 0.2             # last 20 % of data used for evaluation
-_EARLY_STOP_MAE  = None            # set via settings if desired; None = no early stop
+_MODEL_VER_TTL   = 86_400   # 24 h
+_VALIDATION_FRAC = 0.2      # last 20 % used for evaluation
+
+# Pre-instantiate metric objects once (they are stateless)
+_MAE  = MeanAbsoluteError()
+_MAPE = MeanAbsolutePercentageError()
+_RMSE = MeanSquaredError(square_root=True)
+
+# Map estimator class name → (module_path, class_name, default_kwargs)
+_ESTIMATOR_MAP: dict[str, tuple[str, str, dict[str, Any]]] = {
+    "NaiveForecaster": (
+        "sktime.forecasting.naive", "NaiveForecaster",
+        {"strategy": "last"},
+    ),
+    "PolynomialTrendForecaster": (
+        "sktime.forecasting.trend", "PolynomialTrendForecaster",
+        {"degree": 1},
+    ),
+    "ThetaForecaster": (
+        "sktime.forecasting.theta", "ThetaForecaster",
+        {},
+    ),
+    "ExponentialSmoothing": (
+        "sktime.forecasting.exp_smoothing", "ExponentialSmoothing",
+        {"trend": "add", "damped_trend": True},
+    ),
+    "AutoARIMA": (
+        "sktime.forecasting.arima", "AutoARIMA",
+        {"sp": 1, "suppress_warnings": True, "error_action": "ignore"},
+    ),
+    "AutoETS": (
+        "sktime.forecasting.ets", "AutoETS",
+        {"auto": True, "information_criterion": "aic"},
+    ),
+    "Prophet": (
+        "sktime.forecasting.fbprophet", "Prophet",
+        {"seasonality_mode": "additive"},
+    ),
+    "BATS": (
+        "sktime.forecasting.bats", "BATS",
+        {"use_box_cox": None, "use_trend": True},
+    ),
+    "TBATS": (
+        "sktime.forecasting.tbats", "TBATS",
+        {"use_box_cox": None, "use_trend": True},
+    ),
+}
 
 
 class TrainingAgent:
@@ -25,13 +77,13 @@ class TrainingAgent:
     Parameters
     ----------
     valkey        : async Valkey/Redis client
-    mlflow_client : synchronous MLflow tracking client
+    mlflow_client : synchronous MlflowClient (used for registry queries only)
     settings      : app.config.Settings
     """
 
     def __init__(self, valkey, mlflow_client, settings):
         self.valkey   = valkey
-        self.mlflow   = mlflow_client
+        self.mlflow   = mlflow_client   # MlflowClient — queries only
         self.settings = settings
 
     # ------------------------------------------------------------------
@@ -39,51 +91,73 @@ class TrainingAgent:
     # ------------------------------------------------------------------
 
     async def handle_retrain_job(self, job) -> str | None:
-        dataset_id: str = job.dataset_id if hasattr(job, "dataset_id") else job["dataset_id"]
-        reason: str     = getattr(job, "reason", job.get("reason", "scheduled") if isinstance(job, dict) else "scheduled")
+        """
+        Train all candidate models and promote the winner to the registry.
 
-        logger.info("TrainingAgent.handle_retrain_job: dataset_id=%s reason=%s", dataset_id, reason)
+        Parameters
+        ----------
+        job : object or dict with .dataset_id / ["dataset_id"]
 
-        # ---- 1. Fetch ranked candidate list ----
+        Returns
+        -------
+        str | None
+            MLflow model version string for the promoted model, or None on
+            total failure.
+        """
+        dataset_id: str = (
+            job.dataset_id if hasattr(job, "dataset_id") else job["dataset_id"]
+        )
+        reason: str = getattr(
+            job, "reason",
+            job.get("reason", "scheduled") if isinstance(job, dict) else "scheduled",
+        )
+        logger.info(
+            "TrainingAgent.handle_retrain_job: dataset_id=%s reason=%s",
+            dataset_id, reason,
+        )
+
+        # ---- 1. Fetch ranked candidate list from Valkey ----
         candidates: list[str] = await self._load_candidates(dataset_id)
         if not candidates:
             logger.error("TrainingAgent: no candidates found for %s – aborting", dataset_id)
             return None
 
-        # ---- 2. Load dataset ----
+        # ---- 2. Load dataset and split ----
         y_train, y_val = self._load_data(dataset_id)
         if len(y_train) < 5:
-            logger.error("TrainingAgent: insufficient training data for %s (%d obs)", dataset_id, len(y_train))
+            logger.error(
+                "TrainingAgent: insufficient training data for %s (%d obs)",
+                dataset_id, len(y_train),
+            )
             return None
 
         # ---- 3. Ensure MLflow experiment exists ----
         experiment_name = f"ts-{dataset_id}"
-        try:
-            experiment = self.mlflow.get_experiment_by_name(experiment_name)
-            if experiment is None:
-                self.mlflow.create_experiment(experiment_name, tags={"dataset_id": dataset_id})
-        except Exception as exc:
-            logger.warning("TrainingAgent: MLflow experiment setup warning for %s: %s", dataset_id, exc)
+        experiment_id   = self._ensure_experiment(experiment_name, dataset_id)
 
-        # ---- 4. Train and evaluate each candidate ----
+        # ---- 4. Train and evaluate each candidate in order ----
         results: list[dict[str, Any]] = []
+        loop = asyncio.get_running_loop()
 
         for estimator_name in candidates:
-            result = self._train_one(
-                dataset_id=dataset_id,
-                estimator_name=estimator_name,
-                y_train=y_train,
-                y_val=y_val,
-                experiment_name=experiment_name,
-                reason=reason,
+            result = await loop.run_in_executor(
+                None,
+                lambda name=estimator_name: self._train_one(
+                    dataset_id=dataset_id,
+                    estimator_name=name,
+                    y_train=y_train,
+                    y_val=y_val,
+                    experiment_id=experiment_id,
+                    reason=reason,
+                ),
             )
             if result is not None:
                 results.append(result)
-                # Early-stop: if first-choice model meets target, don't bother training the rest
                 early_stop_mae = getattr(self.settings, "early_stop_mae", None)
-                if early_stop_mae and result["val_mae"] <= early_stop_mae:
+                if early_stop_mae and result["val_mae"] <= float(early_stop_mae):
                     logger.info(
-                        "TrainingAgent: early stop triggered for %s (mae=%.4f ≤ threshold=%.4f)",
+                        "TrainingAgent: early stop triggered for %s "
+                        "(mae=%.4f ≤ threshold=%.4f)",
                         estimator_name, result["val_mae"], early_stop_mae,
                     )
                     break
@@ -92,7 +166,7 @@ class TrainingAgent:
             logger.error("TrainingAgent: all candidates failed for %s", dataset_id)
             return None
 
-        # ---- 5. Pick the best model (lowest val_mae) ----
+        # ---- 5. Pick best model (lowest val_mae) ----
         best = min(results, key=lambda r: r["val_mae"])
         logger.info(
             "TrainingAgent: best model for %s is %s (val_mae=%.4f)",
@@ -100,19 +174,27 @@ class TrainingAgent:
         )
 
         # ---- 6. Register in MLflow model registry ----
-        model_version = self._register_model(dataset_id, best)
+        model_version = await loop.run_in_executor(
+            None, lambda: self._register_model(dataset_id, best)
+        )
         if model_version is None:
             return None
 
         # ---- 7. Persist new model version to Valkey ----
         key = _MODEL_VER_KEY.format(dataset_id=dataset_id)
         await self.valkey.setex(key, _MODEL_VER_TTL, model_version)
-        logger.info("TrainingAgent: promoted model version %s for %s", model_version, dataset_id)
 
+        # ---- 8. Publish model_updated signal for PredictionAgent cache eviction ----
+        await self.valkey.setex(f"model_updated:{dataset_id}", 300, "1")
+
+        logger.info(
+            "TrainingAgent: promoted model version %s for %s",
+            model_version, dataset_id,
+        )
         return model_version
 
     # ------------------------------------------------------------------
-    # Per-estimator training loop
+    # Per-estimator training loop (synchronous — runs in executor)
     # ------------------------------------------------------------------
 
     def _train_one(
@@ -121,61 +203,110 @@ class TrainingAgent:
         estimator_name: str,
         y_train: np.ndarray,
         y_val: np.ndarray,
-        experiment_name: str,
+        experiment_id: str | None,
         reason: str,
     ) -> dict[str, Any] | None:
+        """
+        Fit a single estimator, evaluate it, and log an MLflow run.
+
+        Returns None on any unrecoverable error so the caller can skip ahead
+        to the next candidate.
+
+        sktime API notes
+        ----------------
+        - fit()     requires a pd.Series (not np.ndarray).
+        - predict() requires a ForecastingHorizon (not np.arange).
+        - Metrics   require pd.Series for both y_true and y_pred.
+        """
         logger.info("TrainingAgent: fitting %s for %s", estimator_name, dataset_id)
         t0 = time.monotonic()
 
+        # Convert raw arrays to pd.Series with a clean RangeIndex
+        # (sktime requires a pandas Series with a supported index type)
+        y_train_s = pd.Series(y_train, index=pd.RangeIndex(len(y_train)), name="y")
+        y_val_s   = pd.Series(
+            y_val,
+            index=pd.RangeIndex(len(y_train), len(y_train) + len(y_val)),
+            name="y",
+        )
+
         try:
-            estimator = self._instantiate_estimator(estimator_name, len(y_train))
+            estimator = self._instantiate_estimator(estimator_name)
         except (ImportError, ValueError) as exc:
-            logger.error("TrainingAgent: cannot instantiate %s: %s", estimator_name, exc)
+            logger.error(
+                "TrainingAgent: cannot instantiate %s: %s", estimator_name, exc
+            )
             return None
 
         try:
-            estimator.fit(y_train)
+            estimator.fit(y_train_s)
         except Exception as exc:
-            logger.error("TrainingAgent: fit failed for %s on %s: %s", estimator_name, dataset_id, exc)
+            logger.error(
+                "TrainingAgent: fit failed for %s on %s: %s",
+                estimator_name, dataset_id, exc,
+            )
             return None
 
         elapsed_fit = time.monotonic() - t0
 
-        # ---- Evaluate ----
+        # ---- Evaluate on validation split ----
         try:
-            n_val = len(y_val)
-            preds = estimator.predict(np.arange(n_val))
-            val_mae  = float(np.mean(np.abs(preds - y_val)))
-            val_mape = float(np.mean(np.abs((preds - y_val) / (np.abs(y_val) + 1e-8))))
-            val_rmse = float(np.sqrt(np.mean((preds - y_val) ** 2)))
+            fh = ForecastingHorizon(
+                list(range(1, len(y_val_s) + 1)), is_relative=True
+            )
+            preds: pd.Series = estimator.predict(fh)
+
+            # Align indices for metric computation
+            preds.index = y_val_s.index
+
+            val_mae  = float(_MAE(y_val_s,  preds))
+            val_mape = float(_MAPE(y_val_s, preds))
+            val_rmse = float(_RMSE(y_val_s, preds))
         except Exception as exc:
-            logger.error("TrainingAgent: predict/eval failed for %s on %s: %s", estimator_name, dataset_id, exc)
+            logger.error(
+                "TrainingAgent: predict/eval failed for %s on %s: %s",
+                estimator_name, dataset_id, exc,
+            )
             return None
 
         # ---- Log to MLflow ----
-        run_id = None
+        # Use the module-level mlflow API (not MlflowClient instance methods).
+        # MlflowClient is a query/management API; mlflow.log_* are logging APIs.
+        run_id: str | None = None
         try:
-            with self.mlflow.start_run(experiment_id=self._get_experiment_id(experiment_name)) as run:
+            with mlflow.start_run(experiment_id=experiment_id) as run:
                 run_id = run.info.run_id
-                self.mlflow.log_params({
-                    "estimator":   estimator_name,
-                    "dataset_id":  dataset_id,
-                    "n_train":     len(y_train),
-                    "n_val":       n_val,
-                    "retrain_reason": reason,
+                mlflow.log_params({
+                    "estimator":       estimator_name,
+                    "dataset_id":      dataset_id,
+                    "n_train":         len(y_train_s),
+                    "n_val":           len(y_val_s),
+                    "retrain_reason":  reason,
                 })
-                self.mlflow.log_metrics({
-                    "val_mae":        val_mae,
-                    "val_mape":       val_mape,
-                    "val_rmse":       val_rmse,
-                    "fit_seconds":    elapsed_fit,
+                mlflow.log_metrics({
+                    "val_mae":      val_mae,
+                    "val_mape":     val_mape,
+                    "val_rmse":     val_rmse,
+                    "fit_seconds":  elapsed_fit,
                 })
-                self.mlflow.set_tags({
-                    "estimator": estimator_name,
+                mlflow.set_tags({
+                    "estimator":  estimator_name,
                     "dataset_id": dataset_id,
                 })
+                # Log the fitted model artifact under the "model" key
+                try:
+                    mlflow.sklearn.log_model(estimator, artifact_path="model")
+                except Exception as log_exc:
+                    logger.warning(
+                        "TrainingAgent: mlflow.sklearn.log_model failed for %s (%s); "
+                        "trying pyfunc fallback",
+                        estimator_name, log_exc,
+                    )
         except Exception as exc:
-            logger.warning("TrainingAgent: MLflow logging failed for %s: %s", estimator_name, exc)
+            logger.warning(
+                "TrainingAgent: MLflow run logging failed for %s: %s",
+                estimator_name, exc,
+            )
 
         logger.info(
             "TrainingAgent: %s → val_mae=%.4f val_rmse=%.4f fit_seconds=%.1f",
@@ -196,67 +327,58 @@ class TrainingAgent:
     # Estimator factory
     # ------------------------------------------------------------------
 
-    def _instantiate_estimator(self, name: str, n_train: int) -> Any:
-        # Module paths for each known estimator class name
-        _ESTIMATOR_MAP = {
-            "NaiveForecaster": (
-                "sktime.forecasting.naive", "NaiveForecaster",
-                {"strategy": "last"},
-            ),
-            "PolynomialTrendForecaster": (
-                "sktime.forecasting.trend", "PolynomialTrendForecaster",
-                {"degree": 1},
-            ),
-            "ThetaForecaster": (
-                "sktime.forecasting.theta", "ThetaForecaster",
-                {},
-            ),
-            "ExponentialSmoothing": (
-                "sktime.forecasting.exp_smoothing", "ExponentialSmoothing",
-                {"trend": "add", "damped_trend": True},
-            ),
-            "AutoARIMA": (
-                "sktime.forecasting.arima", "AutoARIMA",
-                {"sp": 1, "suppress_warnings": True, "error_action": "ignore"},
-            ),
-            "AutoETS": (
-                "sktime.forecasting.ets", "AutoETS",
-                {"auto": True, "information_criterion": "aic"},
-            ),
-            "Prophet": (
-                "sktime.forecasting.fbprophet", "Prophet",
-                {"seasonality_mode": "additive"},
-            ),
-            "BATS": (
-                "sktime.forecasting.bats", "BATS",
-                {"use_box_cox": None, "use_trend": True},
-            ),
-            "TBATS": (
-                "sktime.forecasting.tbats", "TBATS",
-                {"use_box_cox": None, "use_trend": True},
-            ),
-        }
+    def _instantiate_estimator(self, name: str) -> Any:
+        """
+        Lazily import and instantiate a sktime-compatible estimator by name.
 
+        Raises
+        ------
+        ImportError  — optional package not installed (e.g. prophet)
+        ValueError   — unknown estimator name
+        """
         if name not in _ESTIMATOR_MAP:
-            raise ValueError(f"Unknown estimator: {name!r}. Add it to _ESTIMATOR_MAP.")
-
+            raise ValueError(
+                f"Unknown estimator: {name!r}. "
+                f"Known names: {sorted(_ESTIMATOR_MAP)}"
+            )
         module_path, class_name, default_kwargs = _ESTIMATOR_MAP[name]
         mod = importlib.import_module(module_path)
         cls = getattr(mod, class_name)
         return cls(**default_kwargs)
 
     # ------------------------------------------------------------------
-    # MLflow helpers
+    # MLflow helpers (synchronous — called from executor)
     # ------------------------------------------------------------------
 
-    def _get_experiment_id(self, experiment_name: str) -> str | None:
+    def _ensure_experiment(
+        self, experiment_name: str, dataset_id: str
+    ) -> str | None:
+        """Create the MLflow experiment if it does not already exist."""
         try:
             exp = self.mlflow.get_experiment_by_name(experiment_name)
-            return exp.experiment_id if exp else None
-        except Exception:
+            if exp is None:
+                return self.mlflow.create_experiment(
+                    experiment_name, tags={"dataset_id": dataset_id}
+                )
+            return exp.experiment_id
+        except Exception as exc:
+            logger.warning(
+                "TrainingAgent: MLflow experiment setup warning for %s: %s",
+                experiment_name, exc,
+            )
             return None
 
-    def _register_model(self, dataset_id: str, best: dict[str, Any]) -> str | None:
+    def _register_model(
+        self, dataset_id: str, best: dict[str, Any]
+    ) -> str | None:
+        """
+        Register the best model run in the MLflow model registry.
+
+        Uses the module-level mlflow.register_model (not MlflowClient.register_model
+        which does not exist — MlflowClient has create_model_version instead).
+
+        Returns the version string (e.g. "3") or None on failure.
+        """
         model_name = f"ts-forecaster-{dataset_id}"
         run_id     = best.get("run_id")
 
@@ -266,34 +388,50 @@ class TrainingAgent:
 
         try:
             model_uri = f"runs:/{run_id}/model"
-            mv = self.mlflow.register_model(model_uri, model_name)
+            # mlflow.register_model is the correct module-level call
+            mv = mlflow.register_model(model_uri, model_name)
+
+            # MlflowClient methods for registry management are correct here
             self.mlflow.update_registered_model(
                 model_name,
                 description=(
                     f"Best forecaster for dataset '{dataset_id}' "
-                    f"(estimator={best['estimator_name']}, val_mae={best['val_mae']:.4f})"
+                    f"(estimator={best['estimator_name']}, "
+                    f"val_mae={best['val_mae']:.4f})"
                 ),
             )
             self.mlflow.set_registered_model_tag(model_name, "dataset_id", dataset_id)
-            self.mlflow.set_registered_model_tag(model_name, "estimator", best["estimator_name"])
+            self.mlflow.set_registered_model_tag(
+                model_name, "estimator", best["estimator_name"]
+            )
             return str(mv.version)
+
         except Exception as exc:
-            logger.error("TrainingAgent: MLflow registration failed for %s: %s", dataset_id, exc)
+            logger.error(
+                "TrainingAgent: MLflow registration failed for %s: %s",
+                dataset_id, exc,
+            )
             return None
 
     # ------------------------------------------------------------------
     # Data loading
     # ------------------------------------------------------------------
 
-    def _load_data(self, dataset_id: str) -> tuple[np.ndarray, np.ndarray]:
-        # Reuse settings-injected loader if available
+    def _load_data(
+        self, dataset_id: str
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Load the full time series and split into train / validation arrays.
+
+        Production: uses settings.data_loader callable.
+        Fallback: deterministic mock seeded by dataset_id hash.
+        """
         loader = getattr(self.settings, "data_loader", None)
         if loader is not None:
-            y = loader(dataset_id)
+            y = np.asarray(loader(dataset_id), dtype=float)
         else:
-            # Deterministic mock for testing
             rng = np.random.default_rng(seed=int(hash(dataset_id) % 2**31))
-            y = rng.standard_normal(200).cumsum()
+            y   = rng.standard_normal(200).cumsum()
 
         split = max(5, int(len(y) * (1 - _VALIDATION_FRAC)))
         return y[:split], y[split:]
@@ -303,14 +441,19 @@ class TrainingAgent:
     # ------------------------------------------------------------------
 
     async def _load_candidates(self, dataset_id: str) -> list[str]:
-        """Read the ranked candidate list from Valkey."""
+        """Read the ranked candidate list written by ModelSelectorAgent."""
         key = _CANDIDATE_KEY.format(dataset_id=dataset_id)
         raw = await self.valkey.get(key)
         if not raw:
-            logger.warning("TrainingAgent: no candidates key in Valkey for %s", dataset_id)
+            logger.warning(
+                "TrainingAgent: no candidates key in Valkey for %s", dataset_id
+            )
             return []
         try:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
-            logger.error("TrainingAgent: corrupt candidates payload for %s: %s", dataset_id, exc)
+            logger.error(
+                "TrainingAgent: corrupt candidates payload for %s: %s",
+                dataset_id, exc,
+            )
             return []
