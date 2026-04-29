@@ -157,6 +157,8 @@ The remaining candidates are fitted normally.
 | NaiveForecaster | 81.4483 | 93.1339 | 0.0 |
 | ThetaForecaster | 91.3702 | 102.4195 | 0.0 |
 
+*AutoETS evaluates multiple exponential smoothing configurations and selects the best one based on the data. In this run, higher-ranked LLM candidates (e.g., Prophet, TBATS) were unavailable due to missing dependencies. Among the remaining candidates, AutoETS achieved the lowest validation MAE because it adapts trend and seasonality components automatically.*
+
 ### Step 5 — Winner Promoted, Forecast Served
 
 ```
